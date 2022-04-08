@@ -1,0 +1,199 @@
+from flask import Flask, redirect, url_for, request, render_template, Response
+from werkzeug.utils import secure_filename
+import os
+
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = 'static'
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
+app.config['TEMPLATES_AUTO_RELOAD'] = True
+
+email_global = ''
+
+  
+@app.route('/home', methods=['GET', 'POST'])
+@app.route('/', methods=['GET', 'POST'])
+def homepage():
+    global email_global
+    if request.method == "POST":
+        email_global = request.form['email']
+    return render_template('homepage.html')
+
+@app.route('/stream_options', methods=['GET', 'POST'])
+def stream_options():
+    return render_template('livestreamoptions.html')
+
+@app.route('/submitVideo', methods=['GET', 'POST'])
+def submit():
+    all_videos = []
+    for file in os.listdir("./Static/inputs"):
+        if file.endswith(".mp4"):
+            all_videos.append( file)
+    return render_template('submitvideo.html',data=all_videos)
+
+
+@app.route('/predictVideo', methods=['GET', 'POST'])
+def predict_video():
+    basepath = 'static/inputs'
+    try:
+        vid = request.files['vid']
+        # Save the file
+        file_name = secure_filename(vid.filename)
+        file_path = os.path.join(basepath, file_name)
+        vid.save(file_path)
+    except:
+        file_name = request.form['vid']
+        file_path = os.path.join(basepath, file_name)
+
+
+    os.chdir('darknet')
+    # load in our YOLOv4 architecture network
+    network, class_names, class_colors = load_network("cfg/yolov4-custom.cfg",
+                                                      "data/obj.data",
+                                                      "yolov4-custom_best.weights")
+    width = network_width(network)
+    height = network_height(network)
+
+    # darknet helper function to run detection on image
+    def darknet_helper(img, width, height):
+        darknet_image = make_image(width, height, 3)
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img_resized = cv2.resize(img_rgb, (width, height),
+                                    interpolation=cv2.INTER_LINEAR)
+
+      # get image ratios to convert bounding boxes to proper size
+        img_height, img_width, _ = img.shape
+        width_ratio = img_width/width
+        height_ratio = img_height/height
+
+      # run model on darknet style image to get detections
+        copy_image_from_bytes(darknet_image, img_resized.tobytes())
+        detections = detect_image(network, class_names, darknet_image)
+        free_image(darknet_image)
+        return detections, width_ratio, height_ratio
+
+    os.chdir('..')
+    cap = cv2.VideoCapture(file_path)
+    output_filename = 'static/result.mp4'
+    output_frames_per_second = cap.get(cv2.CAP_PROP_FPS)
+
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    file_size = (640,420)
+    result = cv2.VideoWriter(output_filename,fourcc,output_frames_per_second,file_size)
+    x=0
+
+    while cap.isOpened():
+
+        ret, frame = cap.read()
+        if ret:
+          detections, width_ratio, height_ratio = darknet_helper(frame, width, height)
+
+          for label, confidence, bbox in detections:
+            left, top, right, bottom = bbox2points(bbox)
+            left, top, right, bottom = int(left * width_ratio), int(top * height_ratio), int(right * width_ratio), int(bottom * height_ratio)
+            bbox_array = cv2.rectangle(frame, (left, top), (right, bottom), class_colors[label], 2)
+            bbox_array = cv2.putText(frame, "{} [{:.2f}]".format(label, float(confidence)),
+                              (left, top - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                              class_colors[label], 2)
+
+          if x ==0:                    
+            for i in detections:
+              if i[0] in ['pistol','knife','rifle']:
+                cv2.imwrite('weapon_detected.jpg',frame)
+                send_mail(email_global,'weapon_detected.jpg')
+                x+=1
+                break
+          img=cv2.resize(frame, file_size)
+          result.write(img)
+        else:
+          break
+          
+    cap.release()
+    result.release()
+
+    os.chdir('static')
+    os.system('ffmpeg -i result.mp4 -c:v libx264 -preset slow -crf 20 -c:a aac -b:a 160k -vf format=yuv420p -movflags +faststart ./results/output.mp4')
+    full_filename = os.path.join(basepath, file_name)
+    os.chdir('results')
+    os.rename("./output.mp4",f"{file_name.rstrip('.mp4')}_result.mp4")
+    result_vid = os.path.join(app.config['UPLOAD_FOLDER'], f"./results/{file_name.rstrip('.mp4')}_result.mp4")
+    os.chdir('../..')
+    return render_template("predictvideo.html", soucre=full_filename, result=result_vid)
+
+#############################################################################
+
+def generate_frames(source = 0):
+    os.chdir('darknet')
+    
+    network, class_names, class_colors = load_network("cfg/yolov4-custom.cfg",
+                                                      "data/obj.data",
+                                                      "yolov4-custom_best.weights")
+    width = network_width(network)
+    height = network_height(network)
+
+    # darknet helper function to run detection on image
+    def darknet_helper(img, width, height):
+        darknet_image = make_image(width, height, 3)
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img_resized = cv2.resize(img_rgb, (width, height),
+                                    interpolation=cv2.INTER_LINEAR)
+
+        # get image ratios to convert bounding boxes to proper size
+        img_height, img_width, _ = img.shape
+        width_ratio = img_width/width
+        height_ratio = img_height/height
+
+        # run model on darknet style image to get detections
+        copy_image_from_bytes(darknet_image, img_resized.tobytes())
+        detections = detect_image(network, class_names, darknet_image)
+        free_image(darknet_image)
+        return detections, width_ratio, height_ratio
+    os.chdir('..')
+    if source == 0:
+        camera = cv2.VideoCapture(0)
+    else:
+        camera = cv2.VideoCapture(f'http://{source}/video?type=some.mjpeg')
+    
+    x=0
+    
+    
+    while True:
+        #read this camera frame
+        ret ,frame = camera.read()
+        if not ret:
+            break
+        else:
+            ret , buffer = cv2.imencode('.jpg',frame) 
+            detections, width_ratio, height_ratio = darknet_helper(frame, width, height)
+            #encodes the an image into memory buffer
+            #pass from the backend to front end to catch the frames and stream it
+            for label, confidence, bbox in detections:
+              left, top, right, bottom = bbox2points(bbox)
+              left, top, right, bottom = int(left * width_ratio), int(top * height_ratio), int(right * width_ratio), int(bottom * height_ratio)
+              bbox_array = cv2.rectangle(frame, (left, top), (right, bottom), class_colors[label], 2)
+              bbox_array = cv2.putText(frame, "{} [{:.2f}]".format(label, float(confidence)),
+                                (left, top - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                class_colors[label], 2)
+            if x ==0:                    
+                for i in detections:
+                    if i[0] in ['pistol','knife','rifle']:
+                        cv2.imwrite('deploy.jpg',frame)
+                        send_mail(email_global,'deploy.jpg')
+                        x+=1
+                        break
+
+        ret , buffer = cv2.imencode('.jpg',frame) 
+        frame = buffer.tobytes()
+        yield(b'--frame\r\n'
+             b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+        
+@app.route("/getStream" , methods=['GET', 'POST'])
+def getStream():
+    source = 0
+    if request.method == "POST":
+        source = request.form['camera']
+    return Response(generate_frames(source), mimetype='multipart/x-mixed-replace; boundary=frame')
+    #response calls some function to get the frames from webcam video and pass it back to the html file
+    #to pass function , must set mimtype , mimtype keep the connection between browser and stream content
+
+if __name__ == '__main__':
+    app.run()
